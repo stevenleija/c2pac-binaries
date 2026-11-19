@@ -1,0 +1,211 @@
+diff --git a/c2pa_c_ffi/src/c_api.rs b/c2pa_c_ffi/src/c_api.rs
+index 96504a4..483ed91 100644
+--- a/c2pa_c_ffi/src/c_api.rs
++++ b/c2pa_c_ffi/src/c_api.rs
+@@ -405,12 +405,22 @@ pub type C2paHttpResolverCallback = unsafe extern "C" fn(
+     response: *mut C2paHttpResponse,
+ ) -> c_int;
+ 
++/// Header-aware resolver. `headers` receives a malloc-allocated JSON string map,
++/// which Rust consumes and frees on both success and failure.
++pub type C2paHttpResolverHeadersCallback = unsafe extern "C" fn(
++    context: *mut c_void,
++    request: *const C2paHttpRequest,
++    response: *mut C2paHttpResponse,
++    headers: *mut *mut c_char,
++) -> c_int;
++
+ /// Opaque handle for a C-callback-based HTTP resolver.
+ /// Created by `c2pa_http_resolver_create()`. Either consumed by
+ /// `c2pa_context_builder_set_http_resolver()` or freed via `c2pa_free()`.
+ pub struct C2paHttpResolver {
+     context: *const c_void,
+-    callback: C2paHttpResolverCallback,
++    callback: Option<C2paHttpResolverCallback>,
++    headers_callback: Option<C2paHttpResolverHeadersCallback>,
+ }
+ 
+ // Safety: the caller guarantees that `context` is safe to use from any thread.
+@@ -436,8 +446,32 @@ impl c2pa::http::SyncHttpResolver for C2paHttpResolver {
+             body_len: 0,
+         };
+ 
+-        let rc =
+-            unsafe { (self.callback)(self.context as *mut c_void, &c_request, &mut c_response) };
++        let mut headers_ptr: *mut c_char = std::ptr::null_mut();
++        let rc = unsafe {
++            if let Some(callback) = self.headers_callback {
++                callback(
++                    self.context as *mut c_void,
++                    &c_request,
++                    &mut c_response,
++                    &mut headers_ptr,
++                )
++            } else {
++                (self.callback.expect("resolver callback"))(
++                    self.context as *mut c_void,
++                    &c_request,
++                    &mut c_response,
++                )
++            }
++        };
++        let headers = if headers_ptr.is_null() {
++            Ok(std::collections::HashMap::<String, String>::new())
++        } else {
++            let result = serde_json::from_slice::<std::collections::HashMap<String, String>>(
++                unsafe { std::ffi::CStr::from_ptr(headers_ptr) }.to_bytes(),
++            );
++            unsafe { libc::free(headers_ptr as *mut c_void) };
++            result
++        };
+ 
+         if rc != 0 {
+             // Free any body the callback may have allocated before the error.
+@@ -449,7 +483,16 @@ impl c2pa::http::SyncHttpResolver for C2paHttpResolver {
+             return Err(HttpResolverError::Other(msg.into()));
+         }
+ 
+-        c_response.try_into()
++        let mut response: c2pa::http::http::Response<Box<dyn std::io::Read>> =
++            c_response.try_into()?;
++        for (key, value) in headers.map_err(|e| HttpResolverError::Other(Box::new(e)))? {
++            let name = c2pa::http::http::header::HeaderName::from_bytes(key.as_bytes())
++                .map_err(|e| HttpResolverError::Other(Box::new(e)))?;
++            let value = c2pa::http::http::header::HeaderValue::from_str(&value)
++                .map_err(|e| HttpResolverError::Other(Box::new(e)))?;
++            response.headers_mut().insert(name, value);
++        }
++        Ok(response)
+     }
+ }
+ 
+@@ -816,7 +859,24 @@ pub unsafe extern "C" fn c2pa_http_resolver_create(
+     context: *const c_void,
+     callback: C2paHttpResolverCallback,
+ ) -> *mut C2paHttpResolver {
+-    box_tracked!(C2paHttpResolver { context, callback })
++    box_tracked!(C2paHttpResolver {
++        context,
++        callback: Some(callback),
++        headers_callback: None
++    })
++}
++
++/// Creates a resolver that preserves response headers without changing the legacy ABI.
++#[no_mangle]
++pub unsafe extern "C" fn c2pa_http_resolver_create_with_headers(
++    context: *const c_void,
++    callback: C2paHttpResolverHeadersCallback,
++) -> *mut C2paHttpResolver {
++    box_tracked!(C2paHttpResolver {
++        context,
++        callback: None,
++        headers_callback: Some(callback)
++    })
+ }
+ 
+ /// Sets a custom HTTP resolver on the context builder.
+@@ -2007,12 +2067,12 @@ pub unsafe extern "C" fn c2pa_builder_sign(
+     let c2pa_signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+     ptr_or_return_int!(manifest_bytes_ptr);
+ 
+-    let result = builder.sign(
+-        c2pa_signer.signer.as_ref(),
+-        &format,
+-        &mut *source,
+-        &mut *dest,
+-    );
++    let context = builder.context().clone();
++    let scoped_signer = ContextTimestampSigner {
++        signer: c2pa_signer.signer.as_ref(),
++        context: &context,
++    };
++    let result = builder.sign(&scoped_signer, &format, &mut *source, &mut *dest);
+     let manifest_bytes = ok_or_return_int!(result);
+     let len = manifest_bytes.len() as i64;
+     if !manifest_bytes_ptr.is_null() {
+@@ -2021,6 +2081,57 @@ pub unsafe extern "C" fn c2pa_builder_sign(
+     len
+ }
+ 
++/// Keep timestamp transport on the operation's context rather than Signer's default context.
++struct ContextTimestampSigner<'a> {
++    signer: &'a dyn c2pa::Signer,
++    context: &'a Context,
++}
++
++impl c2pa::Signer for ContextTimestampSigner<'_> {
++    fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
++        self.signer.sign(data)
++    }
++    fn alg(&self) -> SigningAlg {
++        self.signer.alg()
++    }
++    fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
++        self.signer.certs()
++    }
++    fn reserve_size(&self) -> usize {
++        self.signer.reserve_size()
++    }
++    fn time_authority_url(&self) -> Option<String> {
++        self.signer.time_authority_url()
++    }
++    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
++        self.signer.timestamp_request_headers()
++    }
++    fn timestamp_request_body(&self, message: &[u8]) -> c2pa::Result<Vec<u8>> {
++        self.signer.timestamp_request_body(message)
++    }
++    fn ocsp_val(&self) -> Option<Vec<u8>> {
++        self.signer.ocsp_val()
++    }
++    fn direct_cose_handling(&self) -> bool {
++        self.signer.direct_cose_handling()
++    }
++    fn dynamic_assertions(&self) -> Vec<Box<dyn c2pa::dynamic_assertion::DynamicAssertion>> {
++        self.signer.dynamic_assertions()
++    }
++    fn send_timestamp_request(&self, message: &[u8]) -> Option<c2pa::Result<Vec<u8>>> {
++        let url = self.signer.time_authority_url()?;
++        Some((|| {
++            let body = self.signer.timestamp_request_body(message)?;
++            self.context.request_signing_timestamp(
++                &url,
++                self.signer.timestamp_request_headers(),
++                &body,
++                message,
++            )
++        })())
++    }
++}
++
+ /// Sign using the Signer from the Context.
+ ///
+ /// Equivalent to `c2pa_builder_sign` but the signer comes from the Builder's
+diff --git a/sdk/src/context.rs b/sdk/src/context.rs
+index 3f85a96..e7b1016 100644
+--- a/sdk/src/context.rs
++++ b/sdk/src/context.rs
+@@ -774,6 +774,22 @@ impl Context {
+         self.cancel_flag.load(Ordering::Acquire)
+     }
+ 
++    /// Fetch a signing timestamp using this context's resolver and progress policy.
++    pub fn request_signing_timestamp(
++        &self,
++        url: &str,
++        headers: Option<Vec<(String, String)>>,
++        body: &[u8],
++        message: &[u8],
++    ) -> Result<Vec<u8>> {
++        self.check_progress(ProgressPhase::FetchingTimestamp, 1, 2)?;
++        let result =
++            crate::crypto::time_stamp::default_rfc3161_request(url, headers, body, message, self);
++        // Check even when parsing or transport failed, so operation cancellation wins.
++        self.check_progress(ProgressPhase::FetchingTimestamp, 2, 2)?;
++        result.map_err(Error::from)
++    }
++
+     /// Report progress and check for cancellation at a single checkpoint.
+     ///
+     /// Invokes the registered [`ProgressCallbackFunc`] (if any), then checks the
